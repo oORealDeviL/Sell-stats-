@@ -5,9 +5,7 @@ on:
   push:
     branches:
       - main
-
-permissions:
-  contents: read
+      - master
 
 jobs:
   build:
@@ -16,80 +14,126 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v5
+        uses: actions/checkout@v4
 
-      - name: Find project ZIP
-        id: zip
+      - name: Find project archive
+        id: find_zip
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          ZIP_FILE=$(find . -maxdepth 1 -type f -iname "*.zip" | head -n 1)
+          ZIP_FILE="$(find . -maxdepth 3 -type f \( \
+            -iname '*.zip' \
+            -o -iname '*.tar.gz' \
+            -o -iname '*.tgz' \
+          \) -print -quit)"
 
           if [ -z "$ZIP_FILE" ]; then
-            echo "ERROR: No project ZIP found in repository root."
+            echo "ERROR: No project archive found."
+            echo "Files in repository:"
+            find . -maxdepth 3 -type f -print
             exit 1
           fi
 
-          echo "Found: $ZIP_FILE"
-          echo "file=$ZIP_FILE" >> "$GITHUB_OUTPUT"
+          echo "Found archive: $ZIP_FILE"
+          echo "zip=$ZIP_FILE" >> "$GITHUB_OUTPUT"
 
-      - name: Extract project
+      - name: Extract project automatically
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          rm -rf project
-          mkdir project
+          rm -rf extracted
+          mkdir -p extracted
 
-          unzip -q "${{ steps.zip.outputs.file }}" -d project
+          ARCHIVE="${{ steps.find_zip.outputs.zip }}"
 
-          echo "Extracted files:"
-          find project -maxdepth 3 -type f | sort
+          case "$ARCHIVE" in
+            *.zip)
+              unzip -q "$ARCHIVE" -d extracted
+              ;;
+            *.tar.gz|*.tgz)
+              tar -xzf "$ARCHIVE" -C extracted
+              ;;
+            *)
+              echo "Unsupported archive: $ARCHIVE"
+              exit 1
+              ;;
+          esac
+
+          echo "Extraction completed."
+          find extracted -maxdepth 4 -type f | sort
 
       - name: Locate Gradle project
-        id: project
+        id: locate_project
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          ROOT=$(find project -type f -name "build.gradle" -printf '%h\n' | head -n 1)
+          PROJECT_DIR=""
 
-          if [ -z "$ROOT" ]; then
-            echo "ERROR: build.gradle was not found."
+          while IFS= read -r file; do
+            DIR="$(dirname "$file")"
+
+            if [ -f "$DIR/build.gradle" ] || \
+               [ -f "$DIR/build.gradle.kts" ]; then
+              PROJECT_DIR="$DIR"
+              break
+            fi
+          done < <(
+            find extracted \
+              -type f \
+              \( -name 'build.gradle' -o -name 'build.gradle.kts' \) \
+              -print
+          )
+
+          if [ -z "$PROJECT_DIR" ]; then
+            echo "ERROR: Could not find build.gradle or build.gradle.kts"
             exit 1
           fi
 
-          echo "Gradle project: $ROOT"
-          echo "root=$ROOT" >> "$GITHUB_OUTPUT"
+          PROJECT_DIR="$(realpath "$PROJECT_DIR")"
+
+          echo "Gradle project found:"
+          echo "$PROJECT_DIR"
+
+          echo "project=$PROJECT_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Set up Java 25
         uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '25'
+          cache: gradle
 
-      - name: Set up Gradle
-        uses: gradle/actions/setup-gradle@v5
-
-      - name: Build
-        working-directory: ${{ steps.project.outputs.root }}
+      - name: Build with Gradle
+        working-directory: ${{ steps.locate_project.outputs.project }}
         shell: bash
         run: |
-          set -e
+          set -euo pipefail
 
-          gradle clean build --no-daemon
+          if [ -f "./gradlew" ]; then
+            chmod +x ./gradlew
+            ./gradlew build --no-daemon --stacktrace
+          else
+            echo "ERROR: gradlew was not found."
+            echo "The project must contain Gradle Wrapper."
+            exit 1
+          fi
 
       - name: Show generated JARs
-        working-directory: ${{ steps.project.outputs.root }}
+        if: success()
+        working-directory: ${{ steps.locate_project.outputs.project }}
         shell: bash
         run: |
           echo "Generated JAR files:"
-          find build/libs -maxdepth 1 -type f -name "*.jar" -print
+          find build/libs -type f -name '*.jar' -print
 
       - name: Upload JAR
-        uses: actions/upload-artifact@v6
+        if: success()
+        uses: actions/upload-artifact@v4
         with:
-          name: DonutTools-0.4.0
-          path: project/**/build/libs/*.jar
+          name: DonutTools
+          path: |
+            ${{ steps.locate_project.outputs.project }}/build/libs/*.jar
           if-no-files-found: error
