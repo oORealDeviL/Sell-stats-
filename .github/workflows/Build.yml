@@ -1,0 +1,152 @@
+name: Build DonutTools
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Fabric Mod
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Find and extract project ZIP
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          ZIP_FILE=$(find . -maxdepth 3 -type f -iname "*.zip" \
+            -not -path "./.git/*" | head -n 1)
+
+          if [ -z "$ZIP_FILE" ]; then
+            echo "ERROR: No ZIP file found in repository."
+            exit 1
+          fi
+
+          echo "Found ZIP: $ZIP_FILE"
+
+          rm -rf extracted
+          mkdir -p extracted
+
+          python3 - "$ZIP_FILE" <<'PY'
+          import sys
+          import zipfile
+          from pathlib import Path
+
+          zip_path = Path(sys.argv[1])
+          out = Path("extracted")
+          out.mkdir(parents=True, exist_ok=True)
+
+          seen = set()
+
+          with zipfile.ZipFile(zip_path, "r") as z:
+              for info in z.infolist():
+                  name = info.filename.replace("\\", "/")
+
+                  if not name or name.endswith("/"):
+                      continue
+
+                  # Normalize the path
+                  parts = Path(name).parts
+
+                  if ".." in parts:
+                      continue
+
+                  target = out.joinpath(*parts)
+
+                  # The ZIP contains duplicate build.gradle entries.
+                  # Keep the FIRST one because it is the valid Fabric Loom file.
+                  key = str(target)
+
+                  if key in seen:
+                      print(f"Skipping duplicate: {name}")
+                      continue
+
+                  seen.add(key)
+
+                  target.parent.mkdir(parents=True, exist_ok=True)
+
+                  with z.open(info) as src, open(target, "wb") as dst:
+                      dst.write(src.read())
+
+          print("Extraction complete.")
+          PY
+
+          echo "Extracted files:"
+          find extracted -maxdepth 5 -type f | sort
+
+      - name: Locate Gradle project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          PROJECT_DIR=$(find extracted -type f -name "build.gradle" \
+            -not -path "*/.git/*" \
+            -print -quit | xargs dirname)
+
+          if [ -z "$PROJECT_DIR" ] || [ ! -f "$PROJECT_DIR/build.gradle" ]; then
+            echo "ERROR: build.gradle was not found."
+            find extracted -type f | sort
+            exit 1
+          fi
+
+          echo "Gradle project found at: $PROJECT_DIR"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+
+      - name: Verify project versions
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Checking project configuration..."
+
+          grep "minecraft_version=" gradle.properties
+          grep "loader_version=" gradle.properties
+          grep "fabric_api_version=" gradle.properties
+
+          echo "Build file:"
+          head -n 20 build.gradle
+
+      - name: Set up Java 25
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "25"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v5
+        with:
+          gradle-version: "9.4.1"
+
+      - name: Build Fabric mod
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gradle --no-daemon --stacktrace clean build
+
+      - name: Show generated JARs
+        working-directory: ${{ env.PROJECT_DIR }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          echo "Generated JAR files:"
+          find build/libs -maxdepth 1 -type f -name "*.jar" -print
+
+      - name: Upload JAR
+        uses: actions/upload-artifact@v6
+        with:
+          name: DonutTools-0.4.0
+          path: ${{ env.PROJECT_DIR }}/build/libs/*.jar
+          if-no-files-found: error
